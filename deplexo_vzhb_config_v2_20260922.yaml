@@ -1,0 +1,3 @@
+framework: php
+start: php vzhb_deplexo_market_allinone_v2_20260922.php
+port: 3000
