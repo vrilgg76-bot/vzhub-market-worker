@@ -38,6 +38,21 @@ $maxTickPercent = (float)(getenv('MAX_TICK_PERCENT') ?: 0.25);
 $minPrice = (float)(getenv('MIN_PRICE') ?: 1);
 $maxPrice = PHP_FLOAT_MAX;
 
+/*
+ * Random ARA simulator:
+ * each Jakarta calendar day gets one random ARA percentage from 1% to 10,000%.
+ * The day's opening/base price becomes the reference price for the upper limit.
+ */
+const VZHB_ARA_MIN_PERCENT = 1;
+const VZHB_ARA_MAX_PERCENT = 10000;
+$araState = [
+    'date' => date('Y-m-d'),
+    'base_price' => $price,
+    'percent' => mt_rand(VZHB_ARA_MIN_PERCENT, VZHB_ARA_MAX_PERCENT),
+    'upper_price' => 0.0,
+];
+$araState['upper_price'] = $araState['base_price'] * (1.0 + ($araState['percent'] / 100.0));
+
 if ($price < $minPrice) $price = $minPrice;
 // No artificial maximum price ceiling.
 if ($maxTickPercent <= 0) $maxTickPercent = 0.25;
@@ -119,6 +134,9 @@ function saveState(
     array $h2History = [],
     array $h4History = []
 ): void {
+    $ara = isset($GLOBALS['araState']) && is_array($GLOBALS['araState'])
+        ? $GLOBALS['araState']
+        : [];
     $payload = [
         'symbol' => 'VZHB',
         'name' => 'VRILZHUB',
@@ -136,6 +154,7 @@ function saveState(
         'h2_history' => array_slice($h2History, -3000),
         'h4_history' => array_slice($h4History, -2000),
         'price_control' => $priceControl,
+        'ara' => $ara,
     ];
 
     @file_put_contents(
@@ -156,6 +175,7 @@ function loadState(string $file, float $fallbackPrice): array {
             'change_percent' => 0.0,
             'history' => [],
             'price_control' => [],
+            'ara' => [],
         ];
     }
 
@@ -169,6 +189,7 @@ function loadState(string $file, float $fallbackPrice): array {
             'change_percent' => 0.0,
             'history' => [],
             'price_control' => [],
+            'ara' => [],
         ];
     }
 
@@ -178,6 +199,7 @@ function loadState(string $file, float $fallbackPrice): array {
         'change_percent' => isset($data['change_percent']) ? (float)$data['change_percent'] : 0.0,
         'history' => isset($data['history']) && is_array($data['history']) ? $data['history'] : [],
         'price_control' => isset($data['price_control']) && is_array($data['price_control']) ? $data['price_control'] : [],
+        'ara' => isset($data['ara']) && is_array($data['ara']) ? $data['ara'] : [],
     ];
 }
 
@@ -459,11 +481,30 @@ function randomTick(float $currentPrice, float $maxTickPercent, float $minPrice,
 }
 
 $loaded = loadState($stateFile, $price);
+$hadPersistedAra = !empty($loaded['ara']) && is_array($loaded['ara']);
 $price = max($minPrice, (float)$loaded['price']);
 $previousPrice = (float)$loaded['previous_price'];
 $tickHistory = array_slice($loaded['history'], -$historyLimit);
 if (!empty($loaded['price_control']) && is_array($loaded['price_control'])) {
     $priceControl = array_merge($priceControl, $loaded['price_control']);
+}
+
+/* Restore the random ARA for the current day; generate a new one on a new day. */
+if (!empty($loaded['ara']) && is_array($loaded['ara'])) {
+    $araState = array_merge($araState, $loaded['ara']);
+}
+$todayAra = date('Y-m-d');
+if (($araState['date'] ?? '') !== $todayAra || (float)($araState['base_price'] ?? 0) <= 0 || (float)($araState['percent'] ?? 0) <= 0) {
+    $araState = [
+        'date' => $todayAra,
+        'base_price' => $price,
+        'percent' => mt_rand(VZHB_ARA_MIN_PERCENT, VZHB_ARA_MAX_PERCENT),
+        'upper_price' => 0.0,
+    ];
+    $araState['upper_price'] = $araState['base_price'] * (1.0 + ($araState['percent'] / 100.0));
+} else {
+    $araState['upper_price'] = (float)($araState['base_price'] ?? $price)
+        * (1.0 + ((float)($araState['percent'] ?? 0) / 100.0));
 }
 $m1History = isset($loaded['m1_history']) && is_array($loaded['m1_history'])
     ? array_values(array_slice($loaded['m1_history'], -$m1HistoryLimit))
@@ -499,6 +540,18 @@ if (count($m1History) < 120) {
     $h1History = aggregateFromM1($m1History, 60 * 60, $h1HistoryLimit);
     $h2History = aggregateFromM1($m1History, 2 * 60 * 60, $h2HistoryLimit);
     $h4History = aggregateFromM1($m1History, 4 * 60 * 60, $h4HistoryLimit);
+
+    /* Fresh bootstrap: make today's ARA reference the actual current market price. */
+    if (!$hadPersistedAra) {
+        $araState = [
+            'date' => date('Y-m-d'),
+            'base_price' => $price,
+            'percent' => mt_rand(VZHB_ARA_MIN_PERCENT, VZHB_ARA_MAX_PERCENT),
+            'upper_price' => 0.0,
+        ];
+        $araState['upper_price'] = $araState['base_price']
+            * (1.0 + ($araState['percent'] / 100.0));
+    }
 
     saveState(
         $stateFile, $price, $previousPrice, 0.0, $tickHistory, $m1History,
@@ -547,10 +600,49 @@ while (true) {
         if ($steps > 5) $steps = 5; // avoid a giant catch-up after a long pause
 
         for ($i = 0; $i < $steps; $i++) {
+            /* ARA is randomized once per Jakarta calendar day. */
+            $todayAra = date('Y-m-d');
+            if (($araState['date'] ?? '') !== $todayAra) {
+                $araState = [
+                    'date' => $todayAra,
+                    'base_price' => $price,
+                    'percent' => mt_rand(VZHB_ARA_MIN_PERCENT, VZHB_ARA_MAX_PERCENT),
+                    'upper_price' => 0.0,
+                ];
+                $araState['upper_price'] = $araState['base_price']
+                    * (1.0 + ($araState['percent'] / 100.0));
+            }
+
             if (!empty($priceControl['active'])) {
                 [$newPrice, $changePercent, $direction] = controlledTick($price, $priceControl, $minPrice, $maxPrice);
             } else {
                 [$newPrice, $changePercent, $direction] = randomTick($price, $maxTickPercent, $minPrice, $maxPrice);
+            }
+
+            /* Hard ARA ceiling: market/admin movement cannot trade above today's randomized ARA. */
+            $araUpper = (float)($araState['upper_price'] ?? PHP_FLOAT_MAX);
+            if ($araUpper > 0 && $newPrice > $araUpper) {
+                $newPrice = $araUpper;
+                $changePercent = $price > 0 ? (($newPrice - $price) / $price) * 100.0 : 0.0;
+                $direction = $newPrice > $price ? 'up' : ($newPrice < $price ? 'down' : 'flat');
+
+                /* If admin control was aiming above the ARA, stop it at the cap
+                   and let the normal RNG take over on the next tick. */
+                if (!empty($priceControl['active']) && $newPrice >= $araUpper - max(0.00000001, $araUpper * 1e-12)) {
+                    $priceControl = [
+                        'active' => false,
+                        'direction' => null,
+                        'mode' => null,
+                        'start_price' => $price,
+                        'target_price' => null,
+                        'percent' => null,
+                        'duration' => 0,
+                        'started_at' => 0,
+                        'ends_at' => 0,
+                        'step' => null,
+                        'pattern' => 'gradual',
+                    ];
+                }
             }
 
             $previousPrice = $price;
@@ -711,6 +803,14 @@ while (true) {
                 'candles_h4' => $h4Latest,
                 'history_count' => count($m1History),
                 'price_control' => $priceControl,
+                'ara' => [
+                    'date' => $araState['date'],
+                    'base_price' => round((float)$araState['base_price'], 8),
+                    'percent' => round((float)$araState['percent'], 4),
+                    'upper_price' => round((float)$araState['upper_price'], 8),
+                    'min_percent' => VZHB_ARA_MIN_PERCENT,
+                    'max_percent' => VZHB_ARA_MAX_PERCENT,
+                ],
             ]);
         } elseif ($method === 'POST' && $path === '/api/admin/control') {
             $providedKey = $headers['x-vzhb-admin-key'] ?? '';
