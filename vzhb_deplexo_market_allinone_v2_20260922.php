@@ -45,7 +45,19 @@ $stateFile = __DIR__ . DIRECTORY_SEPARATOR . 'vzhb_runtime_state.json';
 $historyLimit = 600;
 // Persistent M1 OHLC history. 10,080 candles = 7 days, enough for H4 aggregation.
 $m1HistoryLimit = 10080;
+// Persistent higher-timeframe retention.
+$m5HistoryLimit = 20160;
+$m30HistoryLimit = 10080;
+$h1HistoryLimit = 5000;
+$h2HistoryLimit = 3000;
+$h4HistoryLimit = 2000;
+
 $m1History = [];
+$m5History = [];
+$m30History = [];
+$h1History = [];
+$h2History = [];
+$h4History = [];
 $tickHistory = [];
 $previousPrice = $price;
 $lastEngineAt = time();
@@ -99,7 +111,12 @@ function saveState(
     float $changePercent,
     array $history,
     array $m1History,
-    array $priceControl = []
+    array $priceControl = [],
+    array $m5History = [],
+    array $m30History = [],
+    array $h1History = [],
+    array $h2History = [],
+    array $h4History = []
 ): void {
     $payload = [
         'symbol' => 'VZHB',
@@ -108,10 +125,15 @@ function saveState(
         'previous_price' => round($previousPrice, 8),
         'change_percent' => round($changePercent, 8),
         'updated_at' => date('Y-m-d H:i:s'),
-        // Keep recent raw ticks for compatibility/debugging.
         'history' => array_slice($history, -600),
-        // Real engine-generated M1 OHLC history used by the chart.
         'm1_history' => array_slice($m1History, -10080),
+        // Persistent multi-timeframe OHLC. These are written on every engine tick,
+        // so candles continue to be created even when no user has the chart open.
+        'm5_history' => array_slice($m5History, -20160),
+        'm30_history' => array_slice($m30History, -10080),
+        'h1_history' => array_slice($h1History, -5000),
+        'h2_history' => array_slice($h2History, -3000),
+        'h4_history' => array_slice($h4History, -2000),
         'price_control' => $priceControl,
     ];
 
@@ -237,6 +259,81 @@ function updateM1Candle(array &$m1History, float $price, int $timestamp, int $li
     if (count($m1History) > $limit) {
         $m1History = array_slice($m1History, -$limit);
     }
+}
+
+
+/**
+ * Generic persistent OHLC candle updater.
+ * A new candle is created automatically when the Unix-time bucket changes.
+ */
+function updateTimeframeCandle(array &$history, float $price, int $timestamp, int $seconds, int $limit): void {
+    $bucket = intdiv($timestamp, $seconds) * $seconds;
+    $lastIndex = count($history) - 1;
+
+    if ($lastIndex >= 0 && (int)($history[$lastIndex]['time'] ?? -1) === $bucket) {
+        $history[$lastIndex]['high'] = round(max((float)$history[$lastIndex]['high'], $price), 8);
+        $history[$lastIndex]['low'] = round(min((float)$history[$lastIndex]['low'], $price), 8);
+        $history[$lastIndex]['close'] = round($price, 8);
+        $history[$lastIndex]['timestamp'] = $bucket;
+        return;
+    }
+
+    $open = $lastIndex >= 0 ? (float)$history[$lastIndex]['close'] : $price;
+
+    // If the worker was paused across one or more candle boundaries, fill each
+    // missing interval with a flat candle so the series never has a time hole.
+    if ($lastIndex >= 0) {
+        $lastBucket = (int)($history[$lastIndex]['time'] ?? $bucket);
+        for ($b = $lastBucket + $seconds; $b < $bucket; $b += $seconds) {
+            $history[] = [
+                'time' => $b,
+                'timestamp' => $b,
+                'open' => round($open, 8),
+                'high' => round($open, 8),
+                'low' => round($open, 8),
+                'close' => round($open, 8),
+            ];
+        }
+    }
+
+    $history[] = [
+        'time' => $bucket,
+        'timestamp' => $bucket,
+        'open' => round($open, 8),
+        'high' => round(max($open, $price), 8),
+        'low' => round(min($open, $price), 8),
+        'close' => round($price, 8),
+    ];
+
+    if (count($history) > $limit) {
+        $history = array_slice($history, -$limit);
+    }
+}
+
+function aggregateFromM1(array $m1History, int $seconds, int $limit): array {
+    $out = [];
+    foreach ($m1History as $c) {
+        $t = (int)($c['time'] ?? $c['timestamp'] ?? 0);
+        if ($t <= 0) continue;
+        $bucket = intdiv($t, $seconds) * $seconds;
+        $close = (float)($c['close'] ?? 0);
+        if (!$out || (int)$out[count($out) - 1]['time'] !== $bucket) {
+            $out[] = [
+                'time' => $bucket,
+                'timestamp' => $bucket,
+                'open' => round((float)($c['open'] ?? $close), 8),
+                'high' => round((float)($c['high'] ?? $close), 8),
+                'low' => round((float)($c['low'] ?? $close), 8),
+                'close' => round($close, 8),
+            ];
+        } else {
+            $i = count($out) - 1;
+            $out[$i]['high'] = round(max((float)$out[$i]['high'], (float)($c['high'] ?? $close)), 8);
+            $out[$i]['low'] = round(min((float)$out[$i]['low'], (float)($c['low'] ?? $close)), 8);
+            $out[$i]['close'] = round($close, 8);
+        }
+    }
+    return array_slice($out, -$limit);
 }
 
 function controlledTick(float $currentPrice, array &$control, float $minPrice, float $maxPrice): array {
@@ -371,6 +468,17 @@ $m1History = isset($loaded['m1_history']) && is_array($loaded['m1_history'])
     ? array_values(array_slice($loaded['m1_history'], -$m1HistoryLimit))
     : [];
 
+$m5History = isset($loaded['m5_history']) && is_array($loaded['m5_history'])
+    ? array_values(array_slice($loaded['m5_history'], -$m5HistoryLimit)) : [];
+$m30History = isset($loaded['m30_history']) && is_array($loaded['m30_history'])
+    ? array_values(array_slice($loaded['m30_history'], -$m30HistoryLimit)) : [];
+$h1History = isset($loaded['h1_history']) && is_array($loaded['h1_history'])
+    ? array_values(array_slice($loaded['h1_history'], -$h1HistoryLimit)) : [];
+$h2History = isset($loaded['h2_history']) && is_array($loaded['h2_history'])
+    ? array_values(array_slice($loaded['h2_history'], -$h2HistoryLimit)) : [];
+$h4History = isset($loaded['h4_history']) && is_array($loaded['h4_history'])
+    ? array_values(array_slice($loaded['h4_history'], -$h4HistoryLimit)) : [];
+
 // A fresh Deplexo container otherwise starts with only a couple of ticks.
 // Warm it with 7 days of the SAME internal RNG engine, then keep it persistent.
 if (count($m1History) < 120) {
@@ -385,8 +493,29 @@ if (count($m1History) < 120) {
     $previousPrice = count($m1History) > 1
         ? (float)$m1History[count($m1History) - 2]['close']
         : $price;
-    saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $m1History, $priceControl);
+    $m5History = aggregateFromM1($m1History, 5 * 60, $m5HistoryLimit);
+    $m30History = aggregateFromM1($m1History, 30 * 60, $m30HistoryLimit);
+    $h1History = aggregateFromM1($m1History, 60 * 60, $h1HistoryLimit);
+    $h2History = aggregateFromM1($m1History, 2 * 60 * 60, $h2HistoryLimit);
+    $h4History = aggregateFromM1($m1History, 4 * 60 * 60, $h4HistoryLimit);
+
+    saveState(
+        $stateFile, $price, $previousPrice, 0.0, $tickHistory, $m1History,
+        $priceControl, $m5History, $m30History, $h1History, $h2History, $h4History
+    );
 }
+
+// Upgrade an older state file that only had M1 candles.
+if (empty($m5History) && !empty($m1History)) $m5History = aggregateFromM1($m1History, 5 * 60, $m5HistoryLimit);
+if (empty($m30History) && !empty($m1History)) $m30History = aggregateFromM1($m1History, 30 * 60, $m30HistoryLimit);
+if (empty($h1History) && !empty($m1History)) $h1History = aggregateFromM1($m1History, 60 * 60, $h1HistoryLimit);
+if (empty($h2History) && !empty($m1History)) $h2History = aggregateFromM1($m1History, 2 * 60 * 60, $h2HistoryLimit);
+if (empty($h4History) && !empty($m1History)) $h4History = aggregateFromM1($m1History, 4 * 60 * 60, $h4HistoryLimit);
+
+saveState(
+    $stateFile, $price, $previousPrice, 0.0, $tickHistory, $m1History,
+    $priceControl, $m5History, $m30History, $h1History, $h2History, $h4History
+);
 
 $server = @stream_socket_server(
     "tcp://0.0.0.0:{$port}",
@@ -439,8 +568,16 @@ while (true) {
                 array_shift($tickHistory);
             }
 
-            // Every live tick updates only the active M1 candle.
-            updateM1Candle($m1History, $price, time(), $m1HistoryLimit);
+            // Every live tick updates ALL persistent timeframes.
+            // A new candle is automatically created at each timeframe boundary:
+            // M5=5m, M30=30m, H1=1h, H2=2h, H4=4h.
+            $candleTime = time();
+            updateM1Candle($m1History, $price, $candleTime, $m1HistoryLimit);
+            updateTimeframeCandle($m5History, $price, $candleTime, 5 * 60, $m5HistoryLimit);
+            updateTimeframeCandle($m30History, $price, $candleTime, 30 * 60, $m30HistoryLimit);
+            updateTimeframeCandle($h1History, $price, $candleTime, 60 * 60, $h1HistoryLimit);
+            updateTimeframeCandle($h2History, $price, $candleTime, 2 * 60 * 60, $h2HistoryLimit);
+            updateTimeframeCandle($h4History, $price, $candleTime, 4 * 60 * 60, $h4HistoryLimit);
 
             saveState(
                 $stateFile,
@@ -449,7 +586,12 @@ while (true) {
                 $changePercent,
                 $tickHistory,
                 $m1History,
-                $priceControl
+                $priceControl,
+                $m5History,
+                $m30History,
+                $h1History,
+                $h2History,
+                $h4History
             );
         }
 
@@ -536,6 +678,11 @@ while (true) {
 
             $latest = array_slice($tickHistory, -min($limit, $historyLimit));
             $m1Latest = array_slice($m1History, -min($limit, $m1HistoryLimit));
+            $m5Latest = array_slice($m5History, -min($limit, $m5HistoryLimit));
+            $m30Latest = array_slice($m30History, -min($limit, $m30HistoryLimit));
+            $h1Latest = array_slice($h1History, -min($limit, $h1HistoryLimit));
+            $h2Latest = array_slice($h2History, -min($limit, $h2HistoryLimit));
+            $h4Latest = array_slice($h4History, -min($limit, $h4HistoryLimit));
 
             $change = $previousPrice > 0
                 ? (($price - $previousPrice) / $previousPrice) * 100.0
@@ -553,8 +700,14 @@ while (true) {
                     'updated_at' => date('Y-m-d H:i:s'),
                 ],
                 'ticks' => $latest,
-                // Stable M1 OHLC series for TradingView-style client aggregation.
+                // Persistent server-side OHLC series. The worker creates these
+                // even when nobody has the website/chart open.
                 'candles_m1' => $m1Latest,
+                'candles_m5' => $m5Latest,
+                'candles_m30' => $m30Latest,
+                'candles_h1' => $h1Latest,
+                'candles_h2' => $h2Latest,
+                'candles_h4' => $h4Latest,
                 'history_count' => count($m1History),
                 'price_control' => $priceControl,
             ]);
