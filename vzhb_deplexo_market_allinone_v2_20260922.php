@@ -42,6 +42,9 @@ if ($maxTickPercent <= 0) $maxTickPercent = 0.25;
 
 $stateFile = __DIR__ . DIRECTORY_SEPARATOR . 'vzhb_runtime_state.json';
 $historyLimit = 600;
+// Persistent M1 OHLC history. 10,080 candles = 7 days, enough for H4 aggregation.
+$m1HistoryLimit = 10080;
+$m1History = [];
 $tickHistory = [];
 $previousPrice = $price;
 $lastEngineAt = time();
@@ -75,7 +78,14 @@ function jsonResponse(int $status, array $data): string {
          . $body;
 }
 
-function saveState(string $file, float $price, float $previousPrice, float $changePercent, array $history): void {
+function saveState(
+    string $file,
+    float $price,
+    float $previousPrice,
+    float $changePercent,
+    array $history,
+    array $m1History
+): void {
     $payload = [
         'symbol' => 'VZHB',
         'name' => 'VRILZHUB',
@@ -83,12 +93,18 @@ function saveState(string $file, float $price, float $previousPrice, float $chan
         'previous_price' => round($previousPrice, 8),
         'change_percent' => round($changePercent, 8),
         'updated_at' => date('Y-m-d H:i:s'),
+        // Keep recent raw ticks for compatibility/debugging.
         'history' => array_slice($history, -600),
+        // Real engine-generated M1 OHLC history used by the chart.
+        'm1_history' => array_slice($m1History, -10080),
     ];
 
     @file_put_contents(
         $file,
-        json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
+        json_encode(
+            $payload,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT
+        ),
         LOCK_EX
     );
 }
@@ -123,6 +139,87 @@ function loadState(string $file, float $fallbackPrice): array {
     ];
 }
 
+
+function makeBootstrapM1History(
+    float $startPrice,
+    int $count,
+    float $maxTickPercent,
+    float $minPrice,
+    float $maxPrice
+): array {
+    /*
+     * The VZHB market is an internal RNG market, not an external exchange.
+     * When a fresh container has no persisted state, create a warm historical
+     * series from the same market engine so every timeframe has real OHLC
+     * data immediately instead of showing only 1-2 candles.
+     */
+    $out = [];
+    $close = $startPrice;
+    $startBucket = intdiv(time(), 60) * 60 - (($count - 1) * 60);
+
+    for ($i = 0; $i < $count; $i++) {
+        $open = $close;
+        $high = $open;
+        $low = $open;
+
+        // Six engine steps per minute gives each M1 candle genuine OHLC movement.
+        for ($j = 0; $j < 6; $j++) {
+            [$next, , ] = randomTick($close, $maxTickPercent, $minPrice, $maxPrice);
+            $close = $next;
+            if ($close > $high) $high = $close;
+            if ($close < $low) $low = $close;
+        }
+
+        $bucket = $startBucket + ($i * 60);
+        $out[] = [
+            'time' => $bucket,
+            'timestamp' => $bucket,
+            'open' => round($open, 8),
+            'high' => round($high, 8),
+            'low' => round($low, 8),
+            'close' => round($close, 8),
+        ];
+    }
+
+    return $out;
+}
+
+function updateM1Candle(array &$m1History, float $price, int $timestamp, int $limit): void {
+    $bucket = intdiv($timestamp, 60) * 60;
+    $lastIndex = count($m1History) - 1;
+
+    if ($lastIndex >= 0 && (int)($m1History[$lastIndex]['time'] ?? -1) === $bucket) {
+        $m1History[$lastIndex]['high'] = round(max(
+            (float)$m1History[$lastIndex]['high'],
+            $price
+        ), 8);
+        $m1History[$lastIndex]['low'] = round(min(
+            (float)$m1History[$lastIndex]['low'],
+            $price
+        ), 8);
+        $m1History[$lastIndex]['close'] = round($price, 8);
+        $m1History[$lastIndex]['timestamp'] = $bucket;
+        return;
+    }
+
+    $open = $lastIndex >= 0
+        ? (float)$m1History[$lastIndex]['close']
+        : $price;
+
+    $m1History[] = [
+        'time' => $bucket,
+        'timestamp' => $bucket,
+        'open' => round($open, 8),
+        'high' => round(max($open, $price), 8),
+        'low' => round(min($open, $price), 8),
+        'close' => round($price, 8),
+    ];
+
+    if (count($m1History) > $limit) {
+        $m1History = array_slice($m1History, -$limit);
+    }
+}
+
 function randomTick(float $currentPrice, float $maxTickPercent, float $minPrice, float $maxPrice): array {
     // Slight upward/downward bias is intentionally absent: every tick is independent.
     $random = mt_rand(-1000000, 1000000) / 1000000;
@@ -145,6 +242,26 @@ $loaded = loadState($stateFile, $price);
 $price = max($minPrice, min($maxPrice, (float)$loaded['price']));
 $previousPrice = (float)$loaded['previous_price'];
 $tickHistory = array_slice($loaded['history'], -$historyLimit);
+$m1History = isset($loaded['m1_history']) && is_array($loaded['m1_history'])
+    ? array_values(array_slice($loaded['m1_history'], -$m1HistoryLimit))
+    : [];
+
+// A fresh Deplexo container otherwise starts with only a couple of ticks.
+// Warm it with 7 days of the SAME internal RNG engine, then keep it persistent.
+if (count($m1History) < 120) {
+    $m1History = makeBootstrapM1History(
+        $price,
+        $m1HistoryLimit,
+        $maxTickPercent,
+        $minPrice,
+        $maxPrice
+    );
+    $price = (float)$m1History[count($m1History) - 1]['close'];
+    $previousPrice = count($m1History) > 1
+        ? (float)$m1History[count($m1History) - 2]['close']
+        : $price;
+    saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $m1History);
+}
 
 $server = @stream_socket_server(
     "tcp://0.0.0.0:{$port}",
@@ -194,7 +311,17 @@ while (true) {
                 array_shift($tickHistory);
             }
 
-            saveState($stateFile, $price, $previousPrice, $changePercent, $tickHistory);
+            // Every live tick updates only the active M1 candle.
+            updateM1Candle($m1History, $price, time(), $m1HistoryLimit);
+
+            saveState(
+                $stateFile,
+                $price,
+                $previousPrice,
+                $changePercent,
+                $tickHistory,
+                $m1History
+            );
         }
 
         $lastTick = $now;
@@ -275,10 +402,11 @@ while (true) {
                 'updated_at' => date('Y-m-d H:i:s'),
             ]);
         } elseif ($method === 'GET' && $path === '/api/market') {
-            $limit = isset($query['limit']) ? (int)$query['limit'] : 120;
-            $limit = max(1, min(300, $limit));
+            $limit = isset($query['limit']) ? (int)$query['limit'] : 10080;
+            $limit = max(1, min(12000, $limit));
 
-            $latest = array_slice($tickHistory, -$limit);
+            $latest = array_slice($tickHistory, -min($limit, $historyLimit));
+            $m1Latest = array_slice($m1History, -min($limit, $m1HistoryLimit));
 
             $change = $previousPrice > 0
                 ? (($price - $previousPrice) / $previousPrice) * 100.0
@@ -296,6 +424,9 @@ while (true) {
                     'updated_at' => date('Y-m-d H:i:s'),
                 ],
                 'ticks' => $latest,
+                // Stable M1 OHLC series for TradingView-style client aggregation.
+                'candles_m1' => $m1Latest,
+                'history_count' => count($m1History),
             ]);
         } elseif ($method === 'POST' && $path === '/api/admin/price') {
             $providedKey = $headers['x-vzhb-admin-key'] ?? '';
@@ -343,7 +474,16 @@ while (true) {
                         array_shift($tickHistory);
                     }
 
-                    saveState($stateFile, $price, $previousPrice, $changePercent, $tickHistory);
+                    updateM1Candle($m1History, $price, time(), $m1HistoryLimit);
+
+                    saveState(
+                        $stateFile,
+                        $price,
+                        $previousPrice,
+                        $changePercent,
+                        $tickHistory,
+                        $m1History
+                    );
 
                     $response = jsonResponse(200, [
                         'ok' => true,
