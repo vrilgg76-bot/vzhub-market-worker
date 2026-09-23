@@ -568,9 +568,33 @@ while (true) {
                 $action = strtolower((string)($payload['action'] ?? 'start'));
 
                 if ($action === 'stop') {
-                    $priceControl['active'] = false;
+                    // HARD STOP: clear the entire control state, not only `active`.
+                    // The next market tick MUST use the original randomTick() path.
+                    $priceControl = [
+                        'active' => false,
+                        'direction' => null,
+                        'mode' => null,
+                        'start_price' => round($price, 8),
+                        'target_price' => null,
+                        'percent' => null,
+                        'duration' => 0,
+                        'started_at' => 0,
+                        'ends_at' => 0,
+                        'step' => null,
+                        'pattern' => 'gradual',
+                    ];
+
+                    // Force the next loop iteration to run immediately so the
+                    // random engine resumes without waiting for the old schedule.
+                    $lastTick = 0.0;
+
                     saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $m1History, $priceControl);
-                    $response = jsonResponse(200, ['ok' => true, 'message' => 'price control stopped', 'price_control' => $priceControl]);
+                    $response = jsonResponse(200, [
+                        'ok' => true,
+                        'message' => 'price control stopped; randomTick resumed',
+                        'price_control' => $priceControl,
+                        'random_tick' => true
+                    ]);
                 } else {
                     $direction = strtolower((string)($payload['direction'] ?? ''));
                     $mode = strtolower((string)($payload['mode'] ?? 'percent'));
