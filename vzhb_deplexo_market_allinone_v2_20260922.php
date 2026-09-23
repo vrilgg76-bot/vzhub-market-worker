@@ -225,42 +225,15 @@ while (true) {
             $newPrice = $price;
 
             if (is_array($movement)) {
-                // Admin-controlled movement. Every engine tick becomes a real
-                // market tick, so the user candle records the actual path.
-                $startAt = (float)($movement['start_at'] ?? microtime(true));
+                $startAt = (float)($movement['start_at'] ?? $now);
                 $duration = max(1, (int)($movement['duration'] ?? 10));
                 $target = (float)($movement['target_price'] ?? $price);
+                $progress = min(1.0, max(0.0, (($now - $startAt) / $duration)));
+                // Smoothstep gives a visible but non-jarring move.
+                $eased = $progress * $progress * (3.0 - 2.0 * $progress);
                 $startPrice = (float)($movement['start_price'] ?? $price);
-                $mode = (string)($movement['movement_type'] ?? 'linear');
-                $elapsed = max(0.0, $now - $startAt);
-                $progress = min(1.0, $elapsed / $duration);
-
-                if ($mode === 'instant') {
-                    $newPrice = $target;
-                } elseif ($mode === 'drastic') {
-                    // Fast at the beginning, then settles into the target.
-                    $eased = 1.0 - pow(1.0 - $progress, 3.0);
-                    $newPrice = $startPrice + (($target - $startPrice) * $eased);
-                } elseif ($mode === 'step') {
-                    // Explicit price movement per second. The final step is
-                    // clamped to the exact target so it never overshoots.
-                    $step = abs((float)($movement['step_value'] ?? 0));
-                    $distance = $target - $startPrice;
-                    if ($step <= 0.0) {
-                        $step = abs($distance) / max(1, $duration);
-                    }
-                    $stepsDone = (int)floor($elapsed);
-                    $moved = min(abs($distance), $step * $stepsDone);
-                    $newPrice = $startPrice + ($distance >= 0 ? $moved : -$moved);
-                } elseif ($mode === 'smooth') {
-                    $eased = $progress * $progress * (3.0 - 2.0 * $progress);
-                    $newPrice = $startPrice + (($target - $startPrice) * $eased);
-                } else {
-                    // Default: constant/linear movement.
-                    $newPrice = $startPrice + (($target - $startPrice) * $progress);
-                }
-
-                if ($progress >= 1.0 || ($mode === 'step' && abs($newPrice - $target) < 0.00000001)) {
+                $newPrice = $startPrice + (($target - $startPrice) * $eased);
+                if ($progress >= 1.0) {
                     $newPrice = $target;
                     $note = (string)($movement['note'] ?? 'Admin market move');
                 }
@@ -277,14 +250,8 @@ while (true) {
 
             if (count($tickHistory) > $historyLimit) array_shift($tickHistory);
 
-            if (is_array($movement)) {
-                $targetNow = (float)($movement['target_price'] ?? $price);
-                $done = abs($price - $targetNow) < 0.00000001;
-                $elapsedNow = $now - (float)($movement['start_at'] ?? $now);
-                if ($done || $elapsedNow >= max(1, (int)($movement['duration'] ?? 10))) {
-                    $price = $targetNow;
-                    $movement = null;
-                }
+            if (is_array($movement) && $price === (float)$movement['target_price']) {
+                $movement = null;
             }
 
             saveState($stateFile, $price, $previousPrice, $changePercent, $tickHistory, $movement, $news);
@@ -450,47 +417,29 @@ while (true) {
                         $response = jsonResponse(200, ['ok'=>true,'message'=>'VZHB price adjusted instantly','old_price'=>round($old,8),'new_price'=>round($price,8),'change_percent'=>round($changePercent,8),'updated_at'=>date('Y-m-d H:i:s')]);
                     }
                 } else {
-                    // Admin movement supports percentage OR exact target price,
-                    // plus four movement profiles: linear, drastic, smooth, step.
-                    $duration = max(1, min(86400, (int)($payload['duration'] ?? 10)));
+                    // Smooth admin movement: price or percent target, over N seconds.
+                    $duration = max(1, min(3600, (int)($payload['duration'] ?? 10)));
                     $mode = (string)($payload['mode'] ?? 'percent');
-                    $movementType = (string)($payload['movement_type'] ?? 'linear');
-                    if (!in_array($movementType, ['linear','drastic','smooth','step','instant'], true)) {
-                        $movementType = 'linear';
-                    }
                     $note = substr((string)($payload['note'] ?? 'Admin market movement'), 0, 200);
                     $startPrice = $price;
                     if ($mode === 'price') {
-                        if (!isset($payload['target_price']) || !is_numeric($payload['target_price'])) {
-                            $response = jsonResponse(400, ['ok'=>false,'error'=>'target_price_required']);
-                            goto movement_done;
-                        }
-                        $target = (float)$payload['target_price'];
+                        $target = (float)($payload['target_price'] ?? 0);
                     } else {
-                        $percent = isset($payload['percent']) && is_numeric($payload['percent']) ? (float)$payload['percent'] : 0.0;
+                        $percent = (float)($payload['percent'] ?? 0);
                         $target = $startPrice * (1.0 + ($percent / 100.0));
                     }
                     $target = max($minPrice, min($maxPrice, $target));
-                    $distance = $target - $startPrice;
-                    $stepValue = isset($payload['step_value']) && is_numeric($payload['step_value']) ? abs((float)$payload['step_value']) : 0.0;
-                    if ($movementType === 'step' && $stepValue <= 0.0) {
-                        $stepValue = abs($distance) / max(1, $duration);
-                    }
                     $movement = [
                         'mode'=>$mode,
-                        'movement_type'=>$movementType,
-                        'direction'=>$distance > 0 ? 'up' : ($distance < 0 ? 'down' : 'flat'),
                         'start_price'=>round($startPrice,8),
                         'target_price'=>round($target,8),
                         'percent'=>round($startPrice > 0 ? (($target-$startPrice)/$startPrice)*100.0 : 0.0,8),
                         'duration'=>$duration,
-                        'step_value'=>round($stepValue,8),
                         'start_at'=>microtime(true),
                         'note'=>$note,
                     ];
                     saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $movement, $news);
                     $response = jsonResponse(200, ['ok'=>true,'message'=>'market movement started','movement'=>$movement,'current_price'=>round($price,8)]);
-                    movement_done:;
                 }
             }
         } else {
