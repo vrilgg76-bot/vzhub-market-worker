@@ -49,3 +49,5 @@ CATATAN PENTING:
 - Worker ini hanya mengurus harga dan history VZHB. Saldo users/portfolio di InfinityFree
   belum disentuh.
 - Jangan menaruh ADMIN_KEY di repository GitHub. Gunakan Environment Variables Deplexo.
+
+
