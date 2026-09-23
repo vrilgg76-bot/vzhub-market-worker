@@ -42,12 +42,11 @@ if ($maxTickPercent <= 0) $maxTickPercent = 0.25;
 
 $stateFile = __DIR__ . DIRECTORY_SEPARATOR . 'vzhb_runtime_state.json';
 $historyLimit = 600;
-// Persistent M1 OHLC history. 10,080 candles = 7 days, enough for H4 aggregation.
-$m1HistoryLimit = 10080;
-$m1History = [];
 $tickHistory = [];
 $previousPrice = $price;
 $lastEngineAt = time();
+$movement = null;
+$news = [];
 
 function jsonResponse(int $status, array $data): string {
     $reason = [
@@ -78,14 +77,7 @@ function jsonResponse(int $status, array $data): string {
          . $body;
 }
 
-function saveState(
-    string $file,
-    float $price,
-    float $previousPrice,
-    float $changePercent,
-    array $history,
-    array $m1History
-): void {
+function saveState(string $file, float $price, float $previousPrice, float $changePercent, array $history, ?array $movement = null, array $news = []): void {
     $payload = [
         'symbol' => 'VZHB',
         'name' => 'VRILZHUB',
@@ -93,18 +85,14 @@ function saveState(
         'previous_price' => round($previousPrice, 8),
         'change_percent' => round($changePercent, 8),
         'updated_at' => date('Y-m-d H:i:s'),
-        // Keep recent raw ticks for compatibility/debugging.
         'history' => array_slice($history, -600),
-        // Real engine-generated M1 OHLC history used by the chart.
-        'm1_history' => array_slice($m1History, -10080),
+        'movement' => $movement,
+        'news' => array_slice($news, -50),
     ];
 
     @file_put_contents(
         $file,
-        json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT
-        ),
+        json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
         LOCK_EX
     );
 }
@@ -136,88 +124,9 @@ function loadState(string $file, float $fallbackPrice): array {
         'previous_price' => isset($data['previous_price']) ? (float)$data['previous_price'] : $fallbackPrice,
         'change_percent' => isset($data['change_percent']) ? (float)$data['change_percent'] : 0.0,
         'history' => isset($data['history']) && is_array($data['history']) ? $data['history'] : [],
+        'movement' => isset($data['movement']) && is_array($data['movement']) ? $data['movement'] : null,
+        'news' => isset($data['news']) && is_array($data['news']) ? $data['news'] : [],
     ];
-}
-
-
-function makeBootstrapM1History(
-    float $startPrice,
-    int $count,
-    float $maxTickPercent,
-    float $minPrice,
-    float $maxPrice
-): array {
-    /*
-     * The VZHB market is an internal RNG market, not an external exchange.
-     * When a fresh container has no persisted state, create a warm historical
-     * series from the same market engine so every timeframe has real OHLC
-     * data immediately instead of showing only 1-2 candles.
-     */
-    $out = [];
-    $close = $startPrice;
-    $startBucket = intdiv(time(), 60) * 60 - (($count - 1) * 60);
-
-    for ($i = 0; $i < $count; $i++) {
-        $open = $close;
-        $high = $open;
-        $low = $open;
-
-        // Six engine steps per minute gives each M1 candle genuine OHLC movement.
-        for ($j = 0; $j < 6; $j++) {
-            [$next, , ] = randomTick($close, $maxTickPercent, $minPrice, $maxPrice);
-            $close = $next;
-            if ($close > $high) $high = $close;
-            if ($close < $low) $low = $close;
-        }
-
-        $bucket = $startBucket + ($i * 60);
-        $out[] = [
-            'time' => $bucket,
-            'timestamp' => $bucket,
-            'open' => round($open, 8),
-            'high' => round($high, 8),
-            'low' => round($low, 8),
-            'close' => round($close, 8),
-        ];
-    }
-
-    return $out;
-}
-
-function updateM1Candle(array &$m1History, float $price, int $timestamp, int $limit): void {
-    $bucket = intdiv($timestamp, 60) * 60;
-    $lastIndex = count($m1History) - 1;
-
-    if ($lastIndex >= 0 && (int)($m1History[$lastIndex]['time'] ?? -1) === $bucket) {
-        $m1History[$lastIndex]['high'] = round(max(
-            (float)$m1History[$lastIndex]['high'],
-            $price
-        ), 8);
-        $m1History[$lastIndex]['low'] = round(min(
-            (float)$m1History[$lastIndex]['low'],
-            $price
-        ), 8);
-        $m1History[$lastIndex]['close'] = round($price, 8);
-        $m1History[$lastIndex]['timestamp'] = $bucket;
-        return;
-    }
-
-    $open = $lastIndex >= 0
-        ? (float)$m1History[$lastIndex]['close']
-        : $price;
-
-    $m1History[] = [
-        'time' => $bucket,
-        'timestamp' => $bucket,
-        'open' => round($open, 8),
-        'high' => round(max($open, $price), 8),
-        'low' => round(min($open, $price), 8),
-        'close' => round($price, 8),
-    ];
-
-    if (count($m1History) > $limit) {
-        $m1History = array_slice($m1History, -$limit);
-    }
 }
 
 function randomTick(float $currentPrice, float $maxTickPercent, float $minPrice, float $maxPrice): array {
@@ -242,25 +151,42 @@ $loaded = loadState($stateFile, $price);
 $price = max($minPrice, min($maxPrice, (float)$loaded['price']));
 $previousPrice = (float)$loaded['previous_price'];
 $tickHistory = array_slice($loaded['history'], -$historyLimit);
-$m1History = isset($loaded['m1_history']) && is_array($loaded['m1_history'])
-    ? array_values(array_slice($loaded['m1_history'], -$m1HistoryLimit))
-    : [];
+$movement = $loaded['movement'] ?? null;
+$news = array_slice($loaded['news'] ?? [], -50);
 
-// A fresh Deplexo container otherwise starts with only a couple of ticks.
-// Warm it with 7 days of the SAME internal RNG engine, then keep it persistent.
-if (count($m1History) < 120) {
-    $m1History = makeBootstrapM1History(
-        $price,
-        $m1HistoryLimit,
-        $maxTickPercent,
-        $minPrice,
-        $maxPrice
-    );
-    $price = (float)$m1History[count($m1History) - 1]['close'];
-    $previousPrice = count($m1History) > 1
-        ? (float)$m1History[count($m1History) - 2]['close']
-        : $price;
-    saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $m1History);
+
+function addTick(array &$tickHistory, float $newPrice, float $oldPrice, string $direction, string $source = 'engine', string $note = ''): float {
+    $changePercent = $oldPrice > 0 ? (($newPrice - $oldPrice) / $oldPrice) * 100.0 : 0.0;
+    $tickHistory[] = [
+        'price' => round($newPrice, 8),
+        'previous_price' => round($oldPrice, 8),
+        'change_percent' => round($changePercent, 8),
+        'direction' => $direction,
+        'created_at' => date('Y-m-d H:i:s'),
+        'timestamp' => time(),
+        'source' => $source,
+        'note' => $note,
+    ];
+    return $changePercent;
+}
+
+function buildM1Candles(array $ticks, int $maxCandles = 10080): array {
+    $groups = [];
+    foreach ($ticks as $t) {
+        if (!isset($t['timestamp'], $t['price'])) continue;
+        $ts = (int)$t['timestamp'];
+        $bucket = intdiv($ts, 60) * 60;
+        $p = (float)$t['price'];
+        if (!isset($groups[$bucket])) {
+            $groups[$bucket] = ['timestamp'=>$bucket,'open'=>$p,'high'=>$p,'low'=>$p,'close'=>$p];
+        } else {
+            $groups[$bucket]['high'] = max($groups[$bucket]['high'], $p);
+            $groups[$bucket]['low'] = min($groups[$bucket]['low'], $p);
+            $groups[$bucket]['close'] = $p;
+        }
+    }
+    ksort($groups, SORT_NUMERIC);
+    return array_values(array_slice($groups, -$maxCandles));
 }
 
 $server = @stream_socket_server(
@@ -286,44 +212,83 @@ $clients = [];
 while (true) {
     $now = microtime(true);
 
-    // Price engine: one tick approximately every second.
+    // One visible market step per second. During an admin movement, the price
+    // walks toward the target instead of teleporting, so the candle visibly
+    // grows/shrinks and the M1 OHLC records every step.
     if (($now - $lastTick) >= 1.0) {
         $steps = (int)floor($now - $lastTick);
-        if ($steps > 5) $steps = 5; // avoid a giant catch-up after a long pause
+        if ($steps > 5) $steps = 5;
 
         for ($i = 0; $i < $steps; $i++) {
-            [$newPrice, $changePercent, $direction] =
-                randomTick($price, $maxTickPercent, $minPrice, $maxPrice);
+            $source = 'engine';
+            $note = '';
+            $newPrice = $price;
 
-            $previousPrice = $price;
-            $price = $newPrice;
+            if (is_array($movement)) {
+                // Admin-controlled movement. Every engine tick becomes a real
+                // market tick, so the user candle records the actual path.
+                $startAt = (float)($movement['start_at'] ?? microtime(true));
+                $duration = max(1, (int)($movement['duration'] ?? 10));
+                $target = (float)($movement['target_price'] ?? $price);
+                $startPrice = (float)($movement['start_price'] ?? $price);
+                $mode = (string)($movement['movement_type'] ?? 'linear');
+                $elapsed = max(0.0, $now - $startAt);
+                $progress = min(1.0, $elapsed / $duration);
 
-            $tickHistory[] = [
-                'price' => round($price, 8),
-                'previous_price' => round($previousPrice, 8),
-                'change_percent' => round($changePercent, 8),
-                'direction' => $direction,
-                'created_at' => date('Y-m-d H:i:s'),
-                'timestamp' => time(),
-            ];
+                if ($mode === 'instant') {
+                    $newPrice = $target;
+                } elseif ($mode === 'drastic') {
+                    // Fast at the beginning, then settles into the target.
+                    $eased = 1.0 - pow(1.0 - $progress, 3.0);
+                    $newPrice = $startPrice + (($target - $startPrice) * $eased);
+                } elseif ($mode === 'step') {
+                    // Explicit price movement per second. The final step is
+                    // clamped to the exact target so it never overshoots.
+                    $step = abs((float)($movement['step_value'] ?? 0));
+                    $distance = $target - $startPrice;
+                    if ($step <= 0.0) {
+                        $step = abs($distance) / max(1, $duration);
+                    }
+                    $stepsDone = (int)floor($elapsed);
+                    $moved = min(abs($distance), $step * $stepsDone);
+                    $newPrice = $startPrice + ($distance >= 0 ? $moved : -$moved);
+                } elseif ($mode === 'smooth') {
+                    $eased = $progress * $progress * (3.0 - 2.0 * $progress);
+                    $newPrice = $startPrice + (($target - $startPrice) * $eased);
+                } else {
+                    // Default: constant/linear movement.
+                    $newPrice = $startPrice + (($target - $startPrice) * $progress);
+                }
 
-            if (count($tickHistory) > $historyLimit) {
-                array_shift($tickHistory);
+                if ($progress >= 1.0 || ($mode === 'step' && abs($newPrice - $target) < 0.00000001)) {
+                    $newPrice = $target;
+                    $note = (string)($movement['note'] ?? 'Admin market move');
+                }
+                $source = 'admin_move';
+            } else {
+                [$newPrice] = randomTick($price, $maxTickPercent, $minPrice, $maxPrice);
             }
 
-            // Every live tick updates only the active M1 candle.
-            updateM1Candle($m1History, $price, time(), $m1HistoryLimit);
+            $newPrice = max($minPrice, min($maxPrice, $newPrice));
+            $previousPrice = $price;
+            $price = $newPrice;
+            $direction = $price > $previousPrice ? 'up' : ($price < $previousPrice ? 'down' : 'flat');
+            $changePercent = addTick($tickHistory, $price, $previousPrice, $direction, $source, $note);
 
-            saveState(
-                $stateFile,
-                $price,
-                $previousPrice,
-                $changePercent,
-                $tickHistory,
-                $m1History
-            );
+            if (count($tickHistory) > $historyLimit) array_shift($tickHistory);
+
+            if (is_array($movement)) {
+                $targetNow = (float)($movement['target_price'] ?? $price);
+                $done = abs($price - $targetNow) < 0.00000001;
+                $elapsedNow = $now - (float)($movement['start_at'] ?? $now);
+                if ($done || $elapsedNow >= max(1, (int)($movement['duration'] ?? 10))) {
+                    $price = $targetNow;
+                    $movement = null;
+                }
+            }
+
+            saveState($stateFile, $price, $previousPrice, $changePercent, $tickHistory, $movement, $news);
         }
-
         $lastTick = $now;
     }
 
@@ -402,11 +367,11 @@ while (true) {
                 'updated_at' => date('Y-m-d H:i:s'),
             ]);
         } elseif ($method === 'GET' && $path === '/api/market') {
-            $limit = isset($query['limit']) ? (int)$query['limit'] : 10080;
-            $limit = max(1, min(12000, $limit));
+            $limit = isset($query['limit']) ? (int)$query['limit'] : 120;
+            $limit = max(1, min($historyLimit, $limit));
 
-            $latest = array_slice($tickHistory, -min($limit, $historyLimit));
-            $m1Latest = array_slice($m1History, -min($limit, $m1HistoryLimit));
+            $latest = array_slice($tickHistory, -$limit);
+            $candlesM1 = buildM1Candles($tickHistory, 10080);
 
             $change = $previousPrice > 0
                 ? (($price - $previousPrice) / $previousPrice) * 100.0
@@ -424,75 +389,108 @@ while (true) {
                     'updated_at' => date('Y-m-d H:i:s'),
                 ],
                 'ticks' => $latest,
-                // Stable M1 OHLC series for TradingView-style client aggregation.
-                'candles_m1' => $m1Latest,
-                'history_count' => count($m1History),
+                'candles_m1' => $candlesM1,
+                'movement' => $movement,
             ]);
-        } elseif ($method === 'POST' && $path === '/api/admin/price') {
+        } elseif ($method === 'GET' && $path === '/api/news') {
+            $response = jsonResponse(200, ['ok' => true, 'news' => array_reverse($news)]);
+        } elseif ($method === 'GET' && $path === '/api/admin/status') {
+            $response = jsonResponse(200, [
+                'ok' => true,
+                'price' => round($price, 8),
+                'movement' => $movement,
+                'news_count' => count($news),
+            ]);
+        } elseif ($method === 'POST' && in_array($path, ['/api/admin/price','/api/admin/move','/api/admin/cancel','/api/admin/news'], true)) {
             $providedKey = $headers['x-vzhb-admin-key'] ?? '';
             if (!hash_equals($adminKey, (string)$providedKey)) {
-                $response = jsonResponse(401, [
-                    'ok' => false,
-                    'error' => 'invalid_admin_key',
-                ]);
+                $response = jsonResponse(401, ['ok' => false, 'error' => 'invalid_admin_key']);
             } else {
                 $payload = json_decode($body, true);
-                if (!is_array($payload)) {
-                    $payload = [];
-                }
+                if (!is_array($payload)) $payload = [];
 
-                $newPrice = isset($payload['price']) ? (float)$payload['price'] : 0.0;
-                $note = isset($payload['note']) ? substr((string)$payload['note'], 0, 200) : 'Admin price adjustment';
-
-                if ($newPrice < $minPrice || $newPrice > $maxPrice) {
-                    $response = jsonResponse(400, [
-                        'ok' => false,
-                        'error' => 'price_out_of_range',
-                        'min_price' => $minPrice,
-                        'max_price' => $maxPrice,
-                    ]);
-                } else {
-                    $old = $price;
-                    $previousPrice = $price;
-                    $price = $newPrice;
-
-                    $changePercent = $old > 0 ? (($price - $old) / $old) * 100.0 : 0.0;
-                    $direction = $price > $old ? 'up' : ($price < $old ? 'down' : 'flat');
-
-                    $tickHistory[] = [
-                        'price' => round($price, 8),
-                        'previous_price' => round($old, 8),
-                        'change_percent' => round($changePercent, 8),
-                        'direction' => $direction,
-                        'created_at' => date('Y-m-d H:i:s'),
-                        'timestamp' => time(),
-                        'source' => 'admin',
-                        'note' => $note,
-                    ];
-
-                    if (count($tickHistory) > $historyLimit) {
-                        array_shift($tickHistory);
+                if ($path === '/api/admin/cancel') {
+                    $movement = null;
+                    $response = jsonResponse(200, ['ok'=>true,'message'=>'movement_cancelled','price'=>round($price,8)]);
+                    saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $movement, $news);
+                } elseif ($path === '/api/admin/news') {
+                    $action = (string)($payload['action'] ?? 'create');
+                    if ($action === 'delete') {
+                        $id = (string)($payload['id'] ?? '');
+                        $news = array_values(array_filter($news, fn($n) => (string)($n['id'] ?? '') !== $id));
+                        $response = jsonResponse(200, ['ok'=>true,'news'=>$news]);
+                    } else {
+                        $title = trim((string)($payload['title'] ?? ''));
+                        $content = trim((string)($payload['content'] ?? ''));
+                        if ($title === '' || $content === '') {
+                            $response = jsonResponse(400, ['ok'=>false,'error'=>'title_and_content_required']);
+                        } else {
+                            $item = ['id'=>bin2hex(random_bytes(6)),'title'=>substr($title,0,120),'content'=>substr($content,0,1000),'created_at'=>date('Y-m-d H:i:s')];
+                            $news[] = $item;
+                            $news = array_slice($news, -50);
+                            saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $movement, $news);
+                            $response = jsonResponse(201, ['ok'=>true,'news'=>$item]);
+                        }
                     }
-
-                    updateM1Candle($m1History, $price, time(), $m1HistoryLimit);
-
-                    saveState(
-                        $stateFile,
-                        $price,
-                        $previousPrice,
-                        $changePercent,
-                        $tickHistory,
-                        $m1History
-                    );
-
-                    $response = jsonResponse(200, [
-                        'ok' => true,
-                        'message' => 'VZHB price adjusted',
-                        'old_price' => round($old, 8),
-                        'new_price' => round($price, 8),
-                        'change_percent' => round($changePercent, 8),
-                        'updated_at' => date('Y-m-d H:i:s'),
-                    ]);
+                } elseif ($path === '/api/admin/price') {
+                    $newPrice = isset($payload['price']) ? (float)$payload['price'] : 0.0;
+                    $note = isset($payload['note']) ? substr((string)$payload['note'], 0, 200) : 'Admin price adjustment';
+                    if ($newPrice < $minPrice || $newPrice > $maxPrice) {
+                        $response = jsonResponse(400, ['ok'=>false,'error'=>'price_out_of_range','min_price'=>$minPrice,'max_price'=>$maxPrice]);
+                    } else {
+                        $old = $price;
+                        $previousPrice = $price;
+                        $price = $newPrice;
+                        $changePercent = $old > 0 ? (($price-$old)/$old)*100.0 : 0.0;
+                        $direction = $price > $old ? 'up' : ($price < $old ? 'down' : 'flat');
+                        addTick($tickHistory, $price, $old, $direction, 'admin', $note);
+                        if (count($tickHistory) > $historyLimit) array_shift($tickHistory);
+                        $movement = null;
+                        saveState($stateFile, $price, $previousPrice, $changePercent, $tickHistory, $movement, $news);
+                        $response = jsonResponse(200, ['ok'=>true,'message'=>'VZHB price adjusted instantly','old_price'=>round($old,8),'new_price'=>round($price,8),'change_percent'=>round($changePercent,8),'updated_at'=>date('Y-m-d H:i:s')]);
+                    }
+                } else {
+                    // Admin movement supports percentage OR exact target price,
+                    // plus four movement profiles: linear, drastic, smooth, step.
+                    $duration = max(1, min(86400, (int)($payload['duration'] ?? 10)));
+                    $mode = (string)($payload['mode'] ?? 'percent');
+                    $movementType = (string)($payload['movement_type'] ?? 'linear');
+                    if (!in_array($movementType, ['linear','drastic','smooth','step','instant'], true)) {
+                        $movementType = 'linear';
+                    }
+                    $note = substr((string)($payload['note'] ?? 'Admin market movement'), 0, 200);
+                    $startPrice = $price;
+                    if ($mode === 'price') {
+                        if (!isset($payload['target_price']) || !is_numeric($payload['target_price'])) {
+                            $response = jsonResponse(400, ['ok'=>false,'error'=>'target_price_required']);
+                            goto movement_done;
+                        }
+                        $target = (float)$payload['target_price'];
+                    } else {
+                        $percent = isset($payload['percent']) && is_numeric($payload['percent']) ? (float)$payload['percent'] : 0.0;
+                        $target = $startPrice * (1.0 + ($percent / 100.0));
+                    }
+                    $target = max($minPrice, min($maxPrice, $target));
+                    $distance = $target - $startPrice;
+                    $stepValue = isset($payload['step_value']) && is_numeric($payload['step_value']) ? abs((float)$payload['step_value']) : 0.0;
+                    if ($movementType === 'step' && $stepValue <= 0.0) {
+                        $stepValue = abs($distance) / max(1, $duration);
+                    }
+                    $movement = [
+                        'mode'=>$mode,
+                        'movement_type'=>$movementType,
+                        'direction'=>$distance > 0 ? 'up' : ($distance < 0 ? 'down' : 'flat'),
+                        'start_price'=>round($startPrice,8),
+                        'target_price'=>round($target,8),
+                        'percent'=>round($startPrice > 0 ? (($target-$startPrice)/$startPrice)*100.0 : 0.0,8),
+                        'duration'=>$duration,
+                        'step_value'=>round($stepValue,8),
+                        'start_at'=>microtime(true),
+                        'note'=>$note,
+                    ];
+                    saveState($stateFile, $price, $previousPrice, 0.0, $tickHistory, $movement, $news);
+                    $response = jsonResponse(200, ['ok'=>true,'message'=>'market movement started','movement'=>$movement,'current_price'=>round($price,8)]);
+                    movement_done:;
                 }
             }
         } else {
